@@ -83,49 +83,86 @@ static void dist_matrix(const double *corr, double *dist, int n) {
     }
 }
 
-// ── Average linkage ──
+// ── Average linkage — O(n^2) nearest-neighbor chain (Müllner 2011) ──
+// Same algorithm SciPy uses for method='average'. Builds raw merges via the
+// NN-chain, then reproduces SciPy's post-processing: sort merges by distance
+// and relabel cluster ids with a union-find, yielding a standard linkage matrix.
 
 typedef struct { int i, j; double dist; int size; } LinkageRow;
 
+static int uf_find(int *parent, int x) {
+    int root = x;
+    while (parent[root] != root) root = parent[root];
+    while (parent[x] != root) { int nx = parent[x]; parent[x] = root; x = nx; }
+    return root;
+}
+
+static int cmp_link(const void *a, const void *b) {
+    double da = ((const LinkageRow *)a)->dist, db = ((const LinkageRow *)b)->dist;
+    return (da > db) - (da < db);
+}
+
 static void average_linkage(const double *dist_in, LinkageRow *Z, int n) {
-    int cap = 2 * n;
-    double *D = (double *)malloc(cap * cap * sizeof(double));
-    bool *active = (bool *)calloc(cap, sizeof(bool));
-    int *sizes = (int *)malloc(cap * sizeof(int));
+    if (n < 2) return;
+    double *D = (double *)malloc((size_t)n * n * sizeof(double));
+    memcpy(D, dist_in, (size_t)n * n * sizeof(double));
+    int *size = (int *)malloc(n * sizeof(int));
+    bool *active = (bool *)malloc(n * sizeof(bool));
+    for (int i = 0; i < n; i++) { size[i] = 1; active[i] = true; }
 
-    for (int i = 0; i < cap * cap; i++) D[i] = 1e18;
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < n; j++) D[i * cap + j] = dist_in[i * n + j];
-        active[i] = true;
-        sizes[i] = 1;
-    }
+    int *chain = (int *)malloc(n * sizeof(int));
+    int clen = 0;
+    LinkageRow *raw = (LinkageRow *)malloc((size_t)(n - 1) * sizeof(LinkageRow));
+    int m = 0;
 
-    for (int step = 0; step < n - 1; step++) {
-        double minD = 1e18;
-        int mi = 0, mj = 0;
-        for (int i = 0; i < n + step; i++) {
-            if (!active[i]) continue;
-            for (int j = i + 1; j < n + step; j++) {
-                if (!active[j]) continue;
-                if (D[i * cap + j] < minD) { minD = D[i * cap + j]; mi = i; mj = j; }
+    for (int s = 0; s < n - 1; s++) {
+        if (clen == 0) {
+            int start = -1;
+            for (int i = 0; i < n; i++) if (active[i]) { start = i; break; }
+            chain[clen++] = start;
+        }
+        int a, b = -1;
+        double mind;
+        for (;;) {
+            a = chain[clen - 1];
+            b = -1; mind = 1e18;
+            if (clen >= 2) { b = chain[clen - 2]; mind = D[(size_t)a * n + b]; }
+            for (int x = 0; x < n; x++) {
+                if (!active[x] || x == a) continue;
+                double d = D[(size_t)a * n + x];
+                if (d < mind) { mind = d; b = x; }
             }
+            if (clen >= 2 && b == chain[clen - 2]) break;  // reciprocal NN
+            chain[clen++] = b;
         }
-        int nid = n + step;
-        sizes[nid] = sizes[mi] + sizes[mj];
-        Z[step] = (LinkageRow){ mi, mj, minD, sizes[nid] };
-
-        for (int k = 0; k < nid; k++) {
-            if (!active[k] || k == mi || k == mj) continue;
-            double nd = (D[mi * cap + k] * sizes[mi] + D[mj * cap + k] * sizes[mj]) / sizes[nid];
-            D[nid * cap + k] = nd;
-            D[k * cap + nid] = nd;
+        clen -= 2;  // pop the reciprocal pair a, b
+        int x = a < b ? a : b, y = a < b ? b : a;
+        int ns = size[x] + size[y];
+        raw[m].i = x; raw[m].j = y; raw[m].dist = mind; raw[m].size = ns; m++;
+        // Lance-Williams average update; the merged cluster lives at index y.
+        for (int k = 0; k < n; k++) {
+            if (!active[k] || k == x || k == y) continue;
+            double nd = (size[x] * D[(size_t)x * n + k] + size[y] * D[(size_t)y * n + k]) / ns;
+            D[(size_t)y * n + k] = nd; D[(size_t)k * n + y] = nd;
         }
-        D[nid * cap + nid] = 0;
-        active[mi] = false;
-        active[mj] = false;
-        active[nid] = true;
+        size[y] = ns; active[x] = false;
     }
-    free(D); free(active); free(sizes);
+
+    // SciPy post-processing: sort by distance, relabel via union-find.
+    qsort(raw, n - 1, sizeof(LinkageRow), cmp_link);
+    int *parent = (int *)malloc((size_t)(2 * n) * sizeof(int));
+    int *usize = (int *)malloc((size_t)(2 * n) * sizeof(int));
+    for (int i = 0; i < 2 * n; i++) { parent[i] = i; usize[i] = 1; }
+    int next = n;
+    for (int k = 0; k < n - 1; k++) {
+        int xr = uf_find(parent, raw[k].i), yr = uf_find(parent, raw[k].j);
+        int lo = xr < yr ? xr : yr, hi = xr < yr ? yr : xr;
+        Z[k].i = lo; Z[k].j = hi; Z[k].dist = raw[k].dist;
+        Z[k].size = usize[xr] + usize[yr];
+        parent[xr] = next; parent[yr] = next; usize[next] = usize[xr] + usize[yr];
+        next++;
+    }
+    free(D); free(size); free(active); free(chain); free(raw); free(parent); free(usize);
 }
 
 // ── Leaf order (iterative) ──
@@ -258,6 +295,11 @@ static void bench(int n, int days) {
     fmt_time(t_ret, s1); fmt_time(t_cov, s2); fmt_time(t_link, s3);
     fmt_time(t_qd, s4); fmt_time(t_w, s5); fmt_time(total, s6);
     printf("  %6d │ %s │ %s │ %s │ %s │ %s │ %s\n", n, s1, s2, s3, s4, s5, s6);
+
+    if (n == 10) {
+        double sum = 0; for (int i = 0; i < n; i++) sum += w[i];
+        fprintf(stderr, "verify N=10: w0=%.12f w1=%.12f w2=%.12f sum=%.6f\n", w[0], w[1], w[2], sum);
+    }
 
     free(prices); free(rets); free(cov); free(corr);
     free(dist); free(Z); free(order); free(qd); free(w);
