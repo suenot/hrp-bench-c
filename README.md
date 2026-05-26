@@ -24,8 +24,8 @@ Five timed stages of the HRP pipeline on `N` assets × 365 daily observations:
 | Stage | Complexity |
 |---|---|
 | Log returns | O(N·T) |
-| Covariance | O(N²·T) |
-| Average linkage | **O(N³)** ← dominates |
+| Covariance | **O(N²·T)** ← dominates |
+| Average linkage | O(N²) (NN-chain) |
 | Quasi-diagonalization | O(N²) |
 | Recursive-bisection weights | O(N log N) |
 
